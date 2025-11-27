@@ -1,71 +1,11 @@
 import cv2
 import numpy as np
 import sys
-
-
-def desenhar_reta(img, rho, theta, cor=(0, 255, 0)):
-    a, b = np.cos(theta), np.sin(theta)
-    x0, y0 = a * rho, b * rho
-    pts = [(int(x0 + 10000 * (-b)), int(y0 + 10000 * a)),
-           (int(x0 - 10000 * (-b)), int(y0 - 10000 * a))]
-    cv2.line(img, pts[0], pts[1], cor, 2)
-
-
-def calcular_intersecao(rho1, theta1, rho2, theta2):
-    a1, b1 = np.cos(theta1), np.sin(theta1)
-    a2, b2 = np.cos(theta2), np.sin(theta2)
-    det = a1 * b2 - a2 * b1
-    
-    if abs(det) < 1e-10:
-        return None
-    
-    x = (b2 * rho1 - b1 * rho2) / det
-    y = (a1 * rho2 - a2 * rho1) / det
-    return (int(x), int(y))
-
-
-def agrupar_retas(retas, rho_thr=20, theta_thr=0.1):
-    if not retas:
-        return []
-    
-    grupos, usadas = [], set()
-    
-    for i, (rho1, theta1) in enumerate(retas):
-        if i in usadas:
-            continue
-        
-        grupo = [(rho1, theta1)]
-        usadas.add(i)
-        
-        for j, (rho2, theta2) in enumerate(retas):
-            if j not in usadas and abs(rho1 - rho2) < rho_thr and abs(theta1 - theta2) < theta_thr:
-                grupo.append((rho2, theta2))
-                usadas.add(j)
-        
-        grupos.append((np.mean([r for r, _ in grupo]), np.mean([t for _, t in grupo])))
-    
-    return grupos
-
-
-def selecionar_linhas(linhas, n=9):
-    if len(linhas) <= n:
-        return sorted(linhas, key=lambda x: x[0])
-    
-    linhas = sorted(linhas, key=lambda x: x[0])
-    rhos = [rho for rho, _ in linhas]
-    espaco_min = (max(rhos) - min(rhos)) / (n * 2)
-    
-    selecionadas = []
-    for rho, theta in linhas:
-        if all(abs(rho - r) >= espaco_min for r, _ in selecionadas):
-            selecionadas.append((rho, theta))
-    
-    if len(selecionadas) > n:
-        indices = np.linspace(0, len(selecionadas) - 1, n, dtype=int)
-        selecionadas = [selecionadas[i] for i in indices]
-    
-    return selecionadas
-
+import os
+from utils import desenhar_reta, calcular_intersecao
+from lines import processar_linhas
+from ransac import ransac_encontrar_tabuleiro
+from genetic import ransac_selecionar_linhas
 
 def detectar_tabuleiro_xadrez(imagem_path):
     img = cv2.imread(imagem_path)
@@ -73,43 +13,90 @@ def detectar_tabuleiro_xadrez(imagem_path):
         print(f"Erro ao carregar '{imagem_path}'")
         return
     
+    # Extrair nome base da imagem para salvar resultados
+    nome_base = os.path.splitext(os.path.basename(imagem_path))[0]
+    
+    # Criar diretório de resultados se não existir
+    os.makedirs('resultados', exist_ok=True)
+    
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150, apertureSize=3)
-    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=150)
+    # Ajuste de parâmetros para detectar mais bordas
+    edges = cv2.Canny(blur, 30, 150, apertureSize=3)
+    # Hough com threshold baixo para detectar mais linhas, depois limitar às mais fortes
+    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=50)
+    
+    # Limitar às 100 linhas mais fortes (HoughLines já retorna ordenado por votos)
+    MAX_LINHAS = 50
+    if lines is not None and len(lines) > MAX_LINHAS:
+        lines = lines[:MAX_LINHAS]
     
     img_edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
     img_lines = img.copy()
+    img_hough = img.copy()
 
     if lines is not None:
         print(f"Retas detectadas: {len(lines)}")
         
-        # Separar horizontais e verticais
-        linhas_horizontais, linhas_verticais = [], []
+        # Desenhar todas as linhas do Hough
         for line in lines:
             rho, theta = line[0]
-            angulo = theta * 180 / np.pi
-            if angulo < 20 or angulo > 160:
-                linhas_horizontais.append((rho, theta))
-            elif 70 < angulo < 110:
-                linhas_verticais.append((rho, theta))
+            desenhar_reta(img_hough, rho, theta, (0, 255, 0))
         
-        # Agrupar e selecionar retas
-        linhas_horizontais = agrupar_retas(linhas_horizontais)
-        linhas_verticais = agrupar_retas(linhas_verticais)
+        cv2.imwrite(f'resultados/{nome_base}_hough.jpg', img_hough)
+        print(f"Salvo: {nome_base}_hough.jpg (todas as linhas detectadas)")
         
-        print(f"Retas agrupadas - H: {len(linhas_horizontais)}, V: {len(linhas_verticais)}")
+        # Processar e classificar linhas
+        linhas_horizontais, linhas_verticais = processar_linhas(lines, w, h)
+        print(f"Retas agrupadas - H: {len(linhas_horizontais)}, V: {len(linhas_verticais)})")
         
-        linhas_horizontais = selecionar_linhas(linhas_horizontais, 9)
-        linhas_verticais = selecionar_linhas(linhas_verticais, 9)
+        # Desenhar linhas após agrupamento (antes do RANSAC)
+        img_antes_ransac = img.copy()
+        for rho, theta in linhas_horizontais:
+            desenhar_reta(img_antes_ransac, rho, theta, (0, 0, 255),6)
+        for rho, theta in linhas_verticais:
+            desenhar_reta(img_antes_ransac, rho, theta, (255, 0, 0),6)
         
-        print(f"Linhas selecionadas - H: {len(linhas_horizontais)}, V: {len(linhas_verticais)}")
+        cv2.imwrite(f'resultados/{nome_base}_antes_ransac.jpg', img_antes_ransac)
+        print(f"Salvo: {nome_base}_antes_ransac.jpg (linhas agrupadas H/V)")
+
+        # Selecionar as 9 melhores linhas de cada direção para formar grid 8x8
+        N_LINHAS_GRID = 9
         
-        # Desenhar retas
+        if len(linhas_horizontais) >= N_LINHAS_GRID and len(linhas_verticais) >= N_LINHAS_GRID:
+            print(f"Iniciando seleção de {N_LINHAS_GRID} linhas por segmentação...")
+            best_h = ransac_selecionar_linhas(linhas_horizontais, N_LINHAS_GRID)
+            best_v = ransac_selecionar_linhas(linhas_verticais, N_LINHAS_GRID)
+            
+            if best_h and best_v:
+                print(f"RANSAC selecionou {len(best_h)}H e {len(best_v)}V linhas.")
+                
+                # Validar ortogonalidade
+                theta_h_medio = np.median([theta for _, theta in best_h])
+                theta_v_medio = np.median([theta for _, theta in best_v])
+                angulo_diff = abs(theta_h_medio - theta_v_medio)
+                ortogonalidade_erro = abs(angulo_diff - np.pi/2)
+                print(f"Ortogonalidade: {np.degrees(ortogonalidade_erro):.2f}° de erro")
+                
+                linhas_horizontais = best_h
+                linhas_verticais = best_v
+                
+                # Desenhar linhas selecionadas pelo RANSAC
+                img_ransac = img.copy()
+                for rho, theta in linhas_horizontais:
+                    desenhar_reta(img_ransac, rho, theta, (0, 0, 255), thickness=2)
+                for rho, theta in linhas_verticais:
+                    desenhar_reta(img_ransac, rho, theta, (255, 0, 0), thickness=2)
+                
+                cv2.imwrite(f'resultados/{nome_base}_ransac_selecionadas.jpg', img_ransac)
+                print(f"Salvo: {nome_base}_ransac_selecionadas.jpg (9H + 9V selecionadas)")
+        else:
+            print(f"Aviso: Insuficientes linhas (H:{len(linhas_horizontais)}, V:{len(linhas_verticais)})")
+        
+        # Desenhar linhas selecionadas
         for rho, theta in linhas_horizontais:
             desenhar_reta(img_lines, rho, theta, (0, 0, 255))
-        
         for rho, theta in linhas_verticais:
             desenhar_reta(img_lines, rho, theta, (255, 0, 0))
         
@@ -123,52 +110,68 @@ def detectar_tabuleiro_xadrez(imagem_path):
         
         print(f"Interseções: {len(intersecoes)}")
         
-        for x, y in intersecoes:
-            cv2.circle(img_lines, (x, y), 5, (0, 255, 0), -1)
-        
-        # Aplicar homografia
-        if len(intersecoes) >= 4:
-            cantos = [
-                min(intersecoes, key=lambda p: p[0] + p[1]),
-                max(intersecoes, key=lambda p: p[0] - p[1]),
-                min(intersecoes, key=lambda p: p[0] - p[1]),
-                max(intersecoes, key=lambda p: p[0] + p[1])
-            ]
+        # RANSAC para encontrar tabuleiro
+        if len(linhas_horizontais) >= 2 and len(linhas_verticais) >= 2:
+            cantos, inliers, _ = ransac_encontrar_tabuleiro(linhas_horizontais, linhas_verticais, intersecoes, n_iter=5000)
             
-            tam = 800
-            src = np.float32(cantos)
-            dst = np.float32([[0, 0], [tam, 0], [0, tam], [tam, tam]])
-            matriz = cv2.getPerspectiveTransform(src, dst)
-            img_homo = cv2.warpPerspective(img, matriz, (tam, tam))
-            
-            # Desenhar cantos
-            for i, pt in enumerate(cantos):
-                cv2.circle(img_lines, pt, 10, (255, 255, 0), -1)
-                cv2.putText(img_lines, str(i+1), pt, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-          
-            
-            cv2.imshow('Homografia', img_homo)
-            cv2.imwrite('resultado_homografia.jpg', img_homo)
-            print("\nHomografia aplicada! Imagens salvas.")
+            if cantos is not None:
+                # Destacar inliers
+                for x, y in inliers:
+                    cv2.circle(img_lines, (x, y), 8, (255, 0, 255), 2)
+                
+                tam = 800
+                src = np.float32(cantos)
+                dst = np.float32([[0, 0], [tam, 0], [0, tam], [tam, tam]])
+                matriz = cv2.getPerspectiveTransform(src, dst)
+                img_homo = cv2.warpPerspective(img, matriz, (tam, tam))
+                
+                # Desenhar cantos encontrados pelo RANSAC
+                for i, pt in enumerate(cantos):
+                    pt_int = (int(pt[0]), int(pt[1]))
+                    cv2.circle(img_lines, pt_int, 12, (0, 255, 255), -1)
+                    cv2.putText(img_lines, str(i+1), pt_int, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+                
+                # Desenhar grid no resultado
+                img_grid = img_homo.copy()
+                casa = tam // 8
+                for i in range(9):
+                    pos = i * casa
+                    cv2.line(img_grid, (pos, 0), (pos, tam), (0, 255, 0), 2)
+                    cv2.line(img_grid, (0, pos), (tam, pos), (0, 255, 0), 2)
+                
+                # cv2.imshow('Homografia', img_homo)
+                # cv2.imshow('Grid', img_grid)
+                cv2.imwrite(f'resultados/{nome_base}_homografia.jpg', img_homo)
+                cv2.imwrite(f'resultados/{nome_base}_grid.jpg', img_grid)
+                print(f"\nRANSAC encontrou tabuleiro com {len(inliers)} pontos!")
+            else:
+                print("\nRANSAC não encontrou um tabuleiro válido.")
         
     else:
         print("Nenhuma reta detectada!")
     
-    cv2.imshow('Original', img)
-    cv2.imshow('Bordas', img_edges)
-    cv2.imshow('Linhas', img_lines)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-    
-    cv2.imwrite('resultado_bordas.jpg', img_edges)
-    cv2.imwrite('resultado_linhas.jpg', img_lines)
+    cv2.imwrite(f'resultados/{nome_base}_linhas.jpg', img_lines)
 
 
 if __name__ == "__main__":
-    img_path = sys.argv[1] if len(sys.argv) > 1 else "img/chess.jpg"
-    if len(sys.argv) == 1:
-        print(f"Usando: {img_path}\nUso: python main.py <imagem>\n")
-    detectar_tabuleiro_xadrez(img_path)
-
-# Afrouxar regra de agrupamento
-# Usar ransac para detectar os 4 melhores pontos que batem com nosso resultado
+    import glob
+    
+    if len(sys.argv) > 1:
+        # Processar imagem específica
+        detectar_tabuleiro_xadrez(sys.argv[1])
+    else:
+        # Processar todas as imagens em img/
+        extensoes = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+        imagens = []
+        for ext in extensoes:
+            imagens.extend(glob.glob(f'img/{ext}'))
+        
+        if not imagens:
+            print("Nenhuma imagem encontrada em img/")
+        else:
+            print(f"Encontradas {len(imagens)} imagens para processar\n")
+            for i, img_path in enumerate(sorted(imagens)):
+                print(f"\n{'='*60}")
+                print(f"[{i+1}/{len(imagens)}] Processando: {img_path}")
+                print('='*60)
+                detectar_tabuleiro_xadrez(img_path)
