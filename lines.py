@@ -61,46 +61,110 @@ def classificar_linhas(lines, max_iter=10):
 
 # --- 2. Agrupamento de Linhas Similares ---
 
-def filtrar_linhas_similares(linhas, threshold_rho=5, threshold_theta=np.pi/36):
+def _ponto_medio_linha(rho, theta, img_shape=(1000, 1000)):
+    """
+    Calcula o ponto médio da linha dentro dos limites da imagem.
+    Equação da linha Hough: x*cos(theta) + y*sin(theta) = rho
+    """
+    h, w = img_shape[:2]
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    
+    # Pontos de interseção com as bordas da imagem
+    pontos = []
+    
+    # Interseção com x=0 (borda esquerda): y = rho / sin(theta)
+    if abs(sin_t) > 1e-6:
+        y = rho / sin_t
+        if 0 <= y <= h:
+            pontos.append((0, y))
+    
+    # Interseção com x=w (borda direita): y = (rho - w*cos(theta)) / sin(theta)
+    if abs(sin_t) > 1e-6:
+        y = (rho - w * cos_t) / sin_t
+        if 0 <= y <= h:
+            pontos.append((w, y))
+    
+    # Interseção com y=0 (borda superior): x = rho / cos(theta)
+    if abs(cos_t) > 1e-6:
+        x = rho / cos_t
+        if 0 <= x <= w:
+            pontos.append((x, 0))
+    
+    # Interseção com y=h (borda inferior): x = (rho - h*sin(theta)) / cos(theta)
+    if abs(cos_t) > 1e-6:
+        x = (rho - h * sin_t) / cos_t
+        if 0 <= x <= w:
+            pontos.append((x, h))
+    
+    if len(pontos) >= 2:
+        # Ponto médio entre os dois pontos de interseção
+        p1, p2 = pontos[0], pontos[1]
+        return ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+    
+    # Fallback: ponto mais próximo da origem na linha
+    return (rho * cos_t, rho * sin_t)
+
+def _distancia_ponto_linha(ponto, rho, theta):
+    """
+    Calcula a distância perpendicular de um ponto (x, y) até a linha.
+    Equação da linha: x*cos(theta) + y*sin(theta) = rho
+    Distância = |x*cos(theta) + y*sin(theta) - rho|
+    """
+    x, y = ponto
+    return abs(x * np.cos(theta) + y * np.sin(theta) - rho)
+
+def filtrar_linhas_similares(linhas, threshold_dist=10, threshold_theta=np.pi/36, img_shape=(1000, 1000)):
     """
     Agrupa linhas similares e retorna representante de cada grupo.
+    Usa distância perpendicular do ponto médio para comparar linhas.
     Retorna lista de tuplas (rho, theta) para compatibilidade com ransac_selecionar_linhas.
     """
     if len(linhas) == 0:
         return []
     
-    # Extrair dados
-    lines_data = [(l[0][0], l[0][1]) for l in linhas]
+    # Extrair dados e calcular pontos médios
+    lines_data = []
+    for l in linhas:
+        rho, theta = l[0][0], l[0][1]
+        pm = _ponto_medio_linha(rho, theta, img_shape)
+        lines_data.append((rho, theta, pm))
     
-    # Ordenar por rho (mais importante para linhas paralelas)
-    lines_data.sort(key=lambda x: x[0])
+    # Ordenar por projeção do ponto médio (para ter ordem espacial consistente)
+    # Usamos x*cos(theta_medio) + y*sin(theta_medio) como critério de ordenação
+    theta_medio = _media_circular([l[1] for l in lines_data])
+    
+    def projecao_ordenacao(item):
+        rho, theta, pm = item
+        return pm[0] * np.cos(theta_medio) + pm[1] * np.sin(theta_medio)
+    
+    lines_data.sort(key=projecao_ordenacao)
     
     merged = []
     current_group = [lines_data[0]]
     
     for i in range(1, len(lines_data)):
-        rho, theta = lines_data[i]
+        rho, theta, pm = lines_data[i]
         
         # Comparar com a PRIMEIRA linha do grupo (evita drift)
-        first_rho, first_theta = current_group[0]
+        first_rho, first_theta, first_pm = current_group[0]
         
-        diff_rho = abs(rho - first_rho)
+        # Distância perpendicular do ponto médio atual até a primeira linha do grupo
+        diff_dist = _distancia_ponto_linha(pm, first_rho, first_theta)
         diff_theta = _distancia_angular_pi(theta, first_theta)
         
-        if diff_rho < threshold_rho and diff_theta < threshold_theta:
-            current_group.append((rho, theta))
+        if diff_dist < threshold_dist and diff_theta < threshold_theta:
+            current_group.append((rho, theta, pm))
         else:
-            # Consolidar grupo: usar média
-            avg_rho = np.mean([r for r, t in current_group])
-            avg_theta = _media_circular([t for r, t in current_group])
-            merged.append((avg_rho, avg_theta))
-            current_group = [(rho, theta)]
+            # Consolidar grupo: usar primeiro item
+            first_rho, first_theta, _ = current_group[0]
+            merged.append((first_rho, first_theta))
+            current_group = [(rho, theta, pm)]
             
     # Último grupo
     if current_group:
-        avg_rho = np.mean([r for r, t in current_group])
-        avg_theta = _media_circular([t for r, t in current_group])
-        merged.append((avg_rho, avg_theta))
+        first_rho, first_theta, _ = current_group[0]
+        merged.append((first_rho, first_theta))
     
     return merged
 
@@ -152,8 +216,9 @@ def processar_linhas(lines, w, h):
     print(f"Filtro angular (±20°): H {len(linhas_h_raw)}->{len(linhas_h_filtradas)}, V {len(linhas_v_raw)}->{len(linhas_v_filtradas)}")
         
     # 3. Agrupar linhas similares
-    linhas_h = filtrar_linhas_similares(linhas_h_filtradas, threshold_rho=5, threshold_theta=np.pi/18)
-    linhas_v = filtrar_linhas_similares(linhas_v_filtradas, threshold_rho=5, threshold_theta=np.pi/18)
+    img_shape = (h, w)
+    linhas_h = filtrar_linhas_similares(linhas_h_filtradas, threshold_dist=10, threshold_theta=np.pi/18, img_shape=img_shape)
+    linhas_v = filtrar_linhas_similares(linhas_v_filtradas, threshold_dist=10, threshold_theta=np.pi/18, img_shape=img_shape)
     
     print(f"Agrupamento: H {len(linhas_h_filtradas)}->{len(linhas_h)}, V {len(linhas_v_filtradas)}->{len(linhas_v)}")
     

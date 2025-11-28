@@ -66,8 +66,31 @@ def detectar_tabuleiro_xadrez(imagem_path):
         
         if len(linhas_horizontais) >= N_LINHAS_GRID and len(linhas_verticais) >= N_LINHAS_GRID:
             print(f"Iniciando seleção de {N_LINHAS_GRID} linhas por segmentação...")
-            best_h = ransac_selecionar_linhas(linhas_horizontais, N_LINHAS_GRID)
-            best_v = ransac_selecionar_linhas(linhas_verticais, N_LINHAS_GRID)
+            
+            # Tentar com tolerância crescente até encontrar 9 linhas
+            best_h = []
+            best_v = []
+            
+            # Tolerâncias crescentes: de 5% até 80%
+            tolerancias = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.80]
+            
+            for tol in tolerancias:
+                if len(best_h) < N_LINHAS_GRID:
+                    best_h = ransac_selecionar_linhas(linhas_horizontais, N_LINHAS_GRID, img_shape=img.shape, tolerancia=tol)
+                    print(f"  H: tolerância {tol:.2f} -> {len(best_h)} linhas")
+                
+                if len(best_v) < N_LINHAS_GRID:
+                    best_v = ransac_selecionar_linhas(linhas_verticais, N_LINHAS_GRID, img_shape=img.shape, tolerancia=tol)
+                    print(f"  V: tolerância {tol:.2f} -> {len(best_v)} linhas")
+                
+                if len(best_h) >= N_LINHAS_GRID and len(best_v) >= N_LINHAS_GRID:
+                    break
+            
+            # Se ainda não temos 9 linhas, usar todas as disponíveis
+            if len(best_h) < N_LINHAS_GRID:
+                print(f"  Aviso: Não foi possível encontrar {N_LINHAS_GRID} linhas H, usando {len(best_h)}")
+            if len(best_v) < N_LINHAS_GRID:
+                print(f"  Aviso: Não foi possível encontrar {N_LINHAS_GRID} linhas V, usando {len(best_v)}")
             
             if best_h and best_v:
                 print(f"RANSAC selecionou {len(best_h)}H e {len(best_v)}V linhas.")
@@ -112,7 +135,28 @@ def detectar_tabuleiro_xadrez(imagem_path):
         
         # RANSAC para encontrar tabuleiro
         if len(linhas_horizontais) >= 2 and len(linhas_verticais) >= 2:
-            cantos, inliers, _ = ransac_encontrar_tabuleiro(linhas_horizontais, linhas_verticais, intersecoes, n_iter=5000)
+            # Se temos exatamente 9 linhas H e V, usar diretamente os cantos extremos
+            if len(linhas_horizontais) == 9 and len(linhas_verticais) == 9:
+                # Calcular os 4 cantos do grid 8x8 usando a primeira e última linha de cada direção
+                h_primeira = linhas_horizontais[0]
+                h_ultima = linhas_horizontais[-1]
+                v_primeira = linhas_verticais[0]
+                v_ultima = linhas_verticais[-1]
+                
+                # Cantos são as interseções das linhas extremas
+                canto_tl = calcular_intersecao(h_primeira[0], h_primeira[1], v_primeira[0], v_primeira[1])
+                canto_tr = calcular_intersecao(h_primeira[0], h_primeira[1], v_ultima[0], v_ultima[1])
+                canto_bl = calcular_intersecao(h_ultima[0], h_ultima[1], v_primeira[0], v_primeira[1])
+                canto_br = calcular_intersecao(h_ultima[0], h_ultima[1], v_ultima[0], v_ultima[1])
+                
+                if all([canto_tl, canto_tr, canto_bl, canto_br]):
+                    cantos = [canto_tl, canto_tr, canto_bl, canto_br]
+                    inliers = intersecoes  # Todas as interseções são inliers
+                    print(f"Grid 8x8 definido diretamente pelas 9 linhas selecionadas")
+                else:
+                    cantos, inliers, _ = ransac_encontrar_tabuleiro(linhas_horizontais, linhas_verticais, intersecoes, n_iter=5000)
+            else:
+                cantos, inliers, _ = ransac_encontrar_tabuleiro(linhas_horizontais, linhas_verticais, intersecoes, n_iter=5000)
             
             if cantos is not None:
                 # Destacar inliers
@@ -143,6 +187,30 @@ def detectar_tabuleiro_xadrez(imagem_path):
                 # cv2.imshow('Grid', img_grid)
                 cv2.imwrite(f'resultados/{nome_base}_homografia.jpg', img_homo)
                 cv2.imwrite(f'resultados/{nome_base}_grid.jpg', img_grid)
+                
+                # Criar imagem final combinada (2x2 grid)
+                # Redimensionar todas para o mesmo tamanho
+                tamanho_cell = 400
+                img_orig_resized = cv2.resize(img, (tamanho_cell, tamanho_cell))
+                img_hough_resized = cv2.resize(img_hough, (tamanho_cell, tamanho_cell))
+                img_lines_resized = cv2.resize(img_lines, (tamanho_cell, tamanho_cell))
+                img_grid_resized = cv2.resize(img_grid, (tamanho_cell, tamanho_cell))
+                
+                # Adicionar títulos
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(img_orig_resized, 'Original', (10, 30), font, 0.8, (0, 255, 0), 2)
+                cv2.putText(img_hough_resized, 'Hough', (10, 30), font, 0.8, (0, 255, 0), 2)
+                cv2.putText(img_lines_resized, 'Linhas', (10, 30), font, 0.8, (0, 255, 0), 2)
+                cv2.putText(img_grid_resized, 'Grid 8x8', (10, 30), font, 0.8, (0, 255, 0), 2)
+                
+                # Montar grid 2x2
+                linha_superior = np.hstack([img_orig_resized, img_hough_resized])
+                linha_inferior = np.hstack([img_lines_resized, img_grid_resized])
+                img_final = np.vstack([linha_superior, linha_inferior])
+                
+                cv2.imwrite(f'resultados/{nome_base}_final.jpg', img_final)
+                print(f"Salvo: {nome_base}_final.jpg (imagem combinada)")
+                
                 print(f"\nRANSAC encontrou tabuleiro com {len(inliers)} pontos!")
             else:
                 print("\nRANSAC não encontrou um tabuleiro válido.")
