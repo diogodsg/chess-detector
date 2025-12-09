@@ -2,10 +2,65 @@ import cv2
 import numpy as np
 import sys
 import os
-from utils import desenhar_reta, calcular_intersecao
+from utils import desenhar_reta, calcular_intersecao, auto_canny, detecta_circulos, tira_circulos_fantasma
 from lines import processar_linhas
 from ransac import ransac_encontrar_tabuleiro
 from genetic import ransac_selecionar_linhas
+
+# blur forte para estimar fundo (tabuleiro / iluminação)
+BACKGROUND_SIGMA = 35
+# blur leve antes do Hough/Canny
+BLUR_HOUGH_KERNEL = 7
+BLUR_HOUGH_SIGMA = 1.5
+         
+
+def detecta_pecas(img_homo, nome_base):
+    # equalização local (ajuda peças pretas e sombras)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    img_eq = clahe.apply(img_homo)
+
+
+    # estima fundo com blur forte e divide -> “achatando” tabuleiro/iluminação
+    bg = cv2.GaussianBlur(img_eq, (0, 0), BACKGROUND_SIGMA)
+    norm = cv2.divide(img_eq, bg, scale=128)
+    norm = cv2.normalize(norm, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # blur leve antes do Canny/Hough
+    norm_blur = cv2.GaussianBlur(norm, (BLUR_HOUGH_KERNEL, BLUR_HOUGH_KERNEL), BLUR_HOUGH_SIGMA)
+
+    # canny com limiares automáticos
+    edges, low, high = auto_canny(norm_blur,
+                                proporcao_fortes=0.05,
+                                low_high_ratio=0.4,
+                                sobel_ksize=3)
+
+    print(f"Limiar Canny baixo = {low}, alto = {high}")
+
+    # hough
+    circulos_detectados = detecta_circulos(norm_blur, high)
+
+    # elimina fantasmas
+    circulos = tira_circulos_fantasma(circulos_detectados)
+
+    # desenha resultado
+    img_color = cv2.cvtColor(img_homo, cv2.COLOR_GRAY2BGR)
+    for (x, y, r) in circulos:
+        cv2.circle(img_color, (x, y), r, (0, 255, 0), 2)
+        #cv2.circle(img_color, (x, y), 2, (0, 0, 255), 3)
+
+    print("Peças detectadas:", len(circulos))
+    cv2.imwrite(f"resultados/{nome_base}_pecas_detectadas.jpg", img_color)
+    cv2.imwrite(f"resultados/{nome_base}Canny.jpg", edges)
+   
+    # cv2.imshow("01 - Original Gray", img_homo)
+    # cv2.imshow("02 - Equalizada (CLAHE)", img_eq)
+    # cv2.imshow("03 - Normalizada", norm)
+    # cv2.imshow("04 - Canny (auto)", edges)
+    # cv2.imshow("05 - Peças detectadas", img_color)
+
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+  
 
 def detectar_tabuleiro_xadrez(imagem_path):
     img = cv2.imread(imagem_path)
@@ -188,6 +243,11 @@ def detectar_tabuleiro_xadrez(imagem_path):
                 cv2.imwrite(f'resultados/{nome_base}_homografia.jpg', img_homo)
                 cv2.imwrite(f'resultados/{nome_base}_grid.jpg', img_grid)
                 
+                # converter para cinza pois o detector de peças só aceita 1 canal
+                img_homo_gray = cv2.cvtColor(img_homo, cv2.COLOR_BGR2GRAY)
+                detecta_pecas(img_homo_gray, nome_base)
+
+
                 # Criar imagem final combinada (2x2 grid)
                 # Redimensionar todas para o mesmo tamanho
                 tamanho_cell = 400
